@@ -1,0 +1,370 @@
+# Stage 2- Plant Project
+
+#!/bin/bash
+# run_star_featurecounts.sh
+# STAR alignment + featureCounts gene counting RNA-seq pipeline for Arabidopsis vasculature UV vs Control
+# Usage: ./run_star_featurecounts.sh
+set -euo pipefail
+IFS=$'\n\t'
+
+# ------------------ SETTINGS ------------------
+SRR_IDS=(SRR12808527 SRR12808528 SRR12808529 SRR12808497 SRR12808498 SRR12808499)
+SAMPLE_NAMES=(Control1 Control2 Control3 UV1 UV2 UV3)
+CONDITIONS=(Control Control Control UV UV UV)
+
+OUTDIR=$(pwd)
+RAWDIR="${OUTDIR}/raw_data"
+QCDIR="${OUTDIR}/qc_results"
+TRIMDIR="${OUTDIR}/trimmed"
+ALIGNDIR="${OUTDIR}/alignments"
+COUNTSDIR="${OUTDIR}/counts"
+LOGDIR="${OUTDIR}/logs"
+TMPDIR="${OUTDIR}/tmp"
+GENOME_DIR="${OUTDIR}/star_index"
+
+# Reference files you must provide (paths)
+GENOME_FA="reference_genome.fa"     # genome FASTA
+GTF="reference_annotations.gtf"     # GTF with gene annotations (gene_id matches desired IDs, e.g., TAIR)
+# STAR requires genome fasta + GTF to build index
+
+# Threads
+NTHREADS=8
+STRAND="0"  # 0 = unstranded, 1 = stranded (forward), 2 = stranded (reverse). Set according to library prep.
+
+# Create directories
+mkdir -p "${RAWDIR}" "${QCDIR}" "${TRIMDIR}" "${ALIGNDIR}" "${COUNTSDIR}" "${LOGDIR}" "${TMPDIR}" "${GENOME_DIR}"
+
+# ------------------ CHECKS ------------------
+for cmd in prefetch fasterq-dump fastqc STAR samtools featureCounts; do
+  command -v "${cmd}" >/dev/null 2>&1 || { echo "[ERROR] ${cmd} not found in PATH. Install it before running."; exit 1; }
+done
+
+if [[ ! -f "${GENOME_FA}" ]]; then
+  echo "[ERROR] Genome FASTA ${GENOME_FA} not found."
+  exit 1
+fi
+if [[ ! -f "${GTF}" ]]; then
+  echo "[ERROR] Annotation GTF ${GTF} not found."
+  exit 1
+fi
+
+# ------------------ SAMPLESHEET ------------------
+SAMPLESHEET="${OUTDIR}/samplesheet.tsv"
+echo -e "sample\tSRR\tcondition" > "${SAMPLESHEET}"
+for i in "${!SRR_IDS[@]}"; do
+  echo -e "${SAMPLE_NAMES[$i]}\t${SRR_IDS[$i]}\t${CONDITIONS[$i]}" >> "${SAMPLESHEET}"
+done
+echo "[INFO] samplesheet -> ${SAMPLESHEET}"
+
+# ------------------ DOWNLOAD & FASTQ CONVERSION ------------------
+for SRR in "${SRR_IDS[@]}"; do
+  echo ">>> Processing ${SRR}" | tee -a "${LOGDIR}/pipeline.log"
+  if [[ -f "${RAWDIR}/${SRR}_1.fastq.gz" && -f "${RAWDIR}/${SRR}_2.fastq.gz" ]]; then
+    echo "  [SKIP] FASTQs exist for ${SRR}" | tee -a "${LOGDIR}/pipeline.log"
+    continue
+  fi
+
+  # prefetch .sra
+  if ! prefetch "${SRR}" -O "${RAWDIR}" --max-size 100G 2> "${LOGDIR}/${SRR}.prefetch.err"; then
+    echo "  [ERROR] prefetch failed for ${SRR}. See ${LOGDIR}/${SRR}.prefetch.err" | tee -a "${LOGDIR}/pipeline.log"
+    continue
+  fi
+
+  # convert to FASTQ
+  if ! fasterq-dump "${RAWDIR}/${SRR}.sra" -O "${RAWDIR}" --split-files -t "${TMPDIR}" 2> "${LOGDIR}/${SRR}.dump.err"; then
+    echo "  [ERROR] fasterq-dump failed for ${SRR}. See ${LOGDIR}/${SRR}.dump.err" | tee -a "${LOGDIR}/pipeline.log"
+    continue
+  fi
+
+  gzip -f "${RAWDIR}/${SRR}_1.fastq"
+  gzip -f "${RAWDIR}/${SRR}_2.fastq"
+
+  # FastQC
+  fastqc -t "${NTHREADS}" "${RAWDIR}/${SRR}_1.fastq.gz" "${RAWDIR}/${SRR}_2.fastq.gz" -o "${QCDIR}" 2> "${LOGDIR}/${SRR}.fastqc.err" || true
+  echo "  [OK] downloaded and FastQC for ${SRR}" | tee -a "${LOGDIR}/pipeline.log"
+done
+
+# Aggregate MultiQC
+if command -v multiqc >/dev/null 2>&1; then
+  multiqc "${QCDIR}" -o "${QCDIR}" || true
+fi
+
+# Trimming
+for SRR in "${SRR_IDS[@]}"; do
+  echo "Trimming ${SRR}..."
+  fastp -i "${RAWDIR}/${SRR}_1.fastq.gz" -I "${RAWDIR}/${SRR}_2.fastq.gz" \
+    -o "${TRIMDIR}/${SRR}_1.trim.fastq.gz" -O "${TRIMDIR}/${SRR}_2.trim.fastq.gz" \
+    -w "${NTHREADS}" -h "${TRIMDIR}/${SRR}.fastp.html" -j "${TRIMDIR}/${SRR}.fastp.json"
+done
+
+USE_DIR="${TRIMDIR}"
+USE_SUFFIX="_1.trim.fastq.gz"
+
+# No trimming (use raw reads)
+# USE_DIR="${RAWDIR}"
+# USE_SUFFIX="_1.fastq.gz"
+
+# ------------------ BUILD STAR INDEX ------------------
+# STAR genome index must be built once. We include common sensible parameters.
+if [[ ! -f "${GENOME_DIR}/SA" ]]; then
+  echo "Building STAR index in ${GENOME_DIR}..."
+  STAR --runThreadN "${NTHREADS}" \
+       --runMode genomeGenerate \
+       --genomeDir "${GENOME_DIR}" \
+       --genomeFastaFiles "${GENOME_FA}" \
+       --sjdbGTFfile "${GTF}" \
+       --sjdbOverhang 100 \
+       --limitGenomeGenerateRAM 31000000000 \
+       2> "${LOGDIR}/star_index.log"
+  echo "STAR index built."
+else
+  echo "STAR index appears present; skipping rebuild."
+fi
+
+# ------------------ ALIGNMENT with STAR ------------------
+# We'll output coordinate-sorted BAM files per sample.
+for i in "${!SRR_IDS[@]}"; do
+  SRR="${SRR_IDS[$i]}"
+  SAMPLE="${SAMPLE_NAMES[$i]}"
+  fq1="${USE_DIR}/${SRR}_1.fastq.gz"
+  fq2="${USE_DIR}/${SRR}_2.fastq.gz"
+  out_prefix="${ALIGNDIR}/${SAMPLE}."
+  bam_out="${ALIGNDIR}/${SAMPLE}.Aligned.sortedByCoord.out.bam"
+
+  if [[ -f "${bam_out}" ]]; then
+    echo "  [SKIP] alignment exists for ${SAMPLE}"
+    continue
+  fi
+
+  echo "Aligning ${SAMPLE} (${SRR}) with STAR..."
+  STAR --runThreadN "${NTHREADS}" \
+       --genomeDir "${GENOME_DIR}" \
+       --readFilesIn "${fq1}" "${fq2}" \
+       --readFilesCommand zcat \
+       --outFileNamePrefix "${out_prefix}" \
+       --outSAMtype BAM SortedByCoordinate \
+       --quantMode TranscriptomeSAM GeneCounts \
+       2> "${LOGDIR}/${SAMPLE}.star.log"
+
+  # STAR writes Sorted BAM as ${out_prefix}Aligned.sortedByCoord.out.bam
+  if [[ ! -f "${bam_out}" ]]; then
+    echo "  [ERROR] STAR did not produce BAM for ${SAMPLE}. See ${LOGDIR}/${SAMPLE}.star.log" | tee -a "${LOGDIR}/pipeline.log"
+    continue
+  fi
+
+  # Index BAM
+  samtools index "${bam_out}"
+  echo "  [OK] STAR alignment finished for ${SAMPLE}"
+done
+
+# ------------------ FEATURECOUNTS (gene-level counting) ------------------
+# featureCounts can take all BAMs and produce a single matrix.
+BAM_LIST=()
+for SAMPLE in "${SAMPLE_NAMES[@]}"; do
+  bam="${ALIGNDIR}/${SAMPLE}.Aligned.sortedByCoord.out.bam"
+  if [[ ! -f "${bam}" ]]; then
+    echo "[WARN] Missing BAM for ${SAMPLE}; skipping in featureCounts."
+    continue
+  fi
+  BAM_LIST+=("${bam}")
+done
+
+if [[ ${#BAM_LIST[@]} -lt 2 ]]; then
+  echo "[ERROR] Not enough BAMs found for counting. Exiting."
+  exit 1
+fi
+
+echo "Running featureCounts on ${#BAM_LIST[@]} BAMs..."
+featureCounts -T "${NTHREADS}" -p -B -C \
+  -a "${GTF}" -o "${COUNTSDIR}/featureCounts.raw.txt" "${BAM_LIST[@]}" 2> "${LOGDIR}/featureCounts.log"
+
+# Convert featureCounts output to a tidy counts matrix (remove first columns)
+# featureCounts output columns: Geneid, Chr, Start, End, Strand, Length, sample1, sample2, ...
+# We'll create counts matrix with header sample names
+awk 'BEGIN{OFS="\t"} NR==1{print $1,$7;next} NR>2{printf "%s",$1; for(i=7;i<=NF;i++) printf "\t%s",$i; printf "\n"}' "${COUNTSDIR}/featureCounts.raw.txt" > "${COUNTSDIR}/counts_matrix.tsv"
+
+# Better approach in R will parse featureCounts output directly; but save a clean counts matrix too:
+# We'll create a header line with sample names:
+header=$(head -n1 "${COUNTSDIR}/featureCounts.raw.txt" | awk '{for(i=7;i<=NF;i++) printf "\t%s",$i; printf "\n"}')
+# Create file with Geneid column and sample counts
+# awk done above produced "Geneid\t<first_sample>" only; let's produce a robust counts CSV with full header in R script instead.
+
+echo "Pipeline preprocessing complete."
+echo "Counts in ${COUNTSDIR}/featureCounts.raw.txt (use R script to parse)."
+
+
+# B --- R Code
+
+#!/usr/bin/env Rscript
+# deseq2_featurecounts.R
+# Usage: Rscript deseq2_featurecounts.R
+# This script reads featureCounts output and performs DE analysis (UV vs Control)
+
+suppressPackageStartupMessages({
+  library(readr)
+  library(DESeq2)
+  library(edgeR)        # optional for normalization, not strictly necessary
+  library(clusterProfiler)
+  library(org.At.tair.db)
+  library(AnnotationDbi)
+  library(ggplot2)
+  library(pheatmap)
+  library(dplyr)
+})
+
+# ------------- SETTINGS -------------
+samplesheet <- "samplesheet.tsv"  # from Bash pipeline
+fc_file <- "counts/featureCounts.raw.txt"  # path produced by featureCounts
+outdir <- "DE_results_featureCounts"
+dir.create(outdir, showWarnings = FALSE)
+
+# ------------- Read samplesheet -------------
+samples <- read_tsv(samplesheet, col_types = cols())
+# Ensure order matches columns in featureCounts (featureCounts lists samples in the order passed)
+print(samples)
+
+# ------------- Read featureCounts output -------------
+# featureCounts.raw.txt has comments starting with '#', header lines: first line shows program, second line has header
+fc_raw <- read_tsv(fc_file, comment = "#")
+# Typical columns: Geneid, Chr, Start, End, Strand, Length, sample1, sample2, ...
+# Extract counts matrix: columns from 7 onward
+count_cols <- colnames(fc_raw)[7:ncol(fc_raw)]
+counts <- fc_raw %>% select(all_of(count_cols))
+rownames(counts) <- fc_raw$Geneid
+
+# Ensure sample names match samples$sample, otherwise rename
+# count_cols might be actual SRR IDs or sample names depending on featureCounts call; print for user
+cat("featureCounts columns:\n")
+print(count_cols)
+
+# If column names are SRR IDs, map them to sample names using samplesheet (SRR column)
+# We'll attempt a mapping: if any count column matches an SRR, replace with sample name
+colnames(counts) <- sapply(colnames(counts), function(x) {
+  if (x %in% samples$SRR) {
+    samples$sample[which(samples$SRR == x)]
+  } else if (x %in% samples$sample) {
+    x
+  } else {
+    # try to strip path or suffix
+    x
+  }
+})
+cat("Renamed count columns to:\n")
+print(colnames(counts))
+
+# Confirm columns order matches samples$sample
+if(!all(samples$sample %in% colnames(counts))) {
+  stop("Sample names in samplesheet do not match columns in counts matrix. Check order/mapping.")
+}
+# Reorder counts to match samplesheet
+counts <- counts[, samples$sample]
+
+# Coerce to integer matrix
+counts_mat <- as.matrix(counts)
+mode(counts_mat) <- "integer"
+
+# ------------- DESeq2 analysis -------------
+coldata <- data.frame(row.names = samples$sample,
+                      condition = factor(samples$condition, levels = c("Control", "UV")))
+dds <- DESeqDataSetFromMatrix(countData = counts_mat, colData = coldata, design = ~ condition)
+
+# Pre-filter low count genes
+keep <- rowSums(counts(dds) >= 10) >= 2
+dds <- dds[keep, ]
+
+dds <- DESeq(dds)
+
+# Results: contrast UV vs Control (log2FC > 0 = up in UV)
+res <- results(dds, contrast = c("condition", "UV", "Control"))
+# Shrink LFC for more stable effect sizes (apeglm recommended)
+if(requireNamespace("apeglm", quietly = TRUE)) {
+  res <- lfcShrink(dds, coef = "condition_UV_vs_Control", type = "apeglm")
+} else {
+  message("apeglm not installed; using raw LFCs")
+}
+
+resOrdered <- res[order(res$padj), ]
+resDF <- as.data.frame(resOrdered)
+resDF$gene <- rownames(resDF)
+
+# Full results
+write.csv(resDF, file = file.path(outdir, "DESeq2_featureCounts_full.csv"), row.names = FALSE)
+
+# Top 100 DE genes (by padj)
+top100 <- head(resDF[!is.na(resDF$padj), ], 100)
+write.csv(top100, file = file.path(outdir, "top100_DE_genes.csv"), row.names = FALSE)
+cat("Wrote top100_DE_genes.csv\n")
+
+# Volcano plot
+resDF$negLogP <- -log10(resDF$pvalue)
+p <- ggplot(resDF, aes(x = log2FoldChange, y = negLogP)) +
+  geom_point(alpha = 0.4) +
+  theme_minimal() +
+  xlab("log2 Fold Change (UV / Control)") +
+  ylab("-log10(pvalue)") +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "red") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "red") +
+  ggtitle("Volcano plot: UV vs Control (featureCounts)")
+ggsave(filename = file.path(outdir, "volcano_featureCounts.png"), plot = p, width = 7, height = 5)
+
+# VST for heatmaps
+vsd <- vst(dds, blind = FALSE)
+# Heatmap of top 30 by padj
+top30 <- head(top100$gene, 30)
+mat <- assay(vsd)[top30, , drop = FALSE]
+annotation_col <- data.frame(condition = samples$condition)
+rownames(annotation_col) <- samples$sample
+pheatmap(mat, cluster_rows = TRUE, cluster_cols = TRUE, show_rownames = TRUE,
+         annotation_col = annotation_col, filename = file.path(outdir, "heatmap_top30.png"))
+
+# ------------- Enrichment analysis -------------
+# Use significant genes padj < 0.05
+sig_genes <- rownames(res)[which(res$padj < 0.05 & !is.na(res$padj))]
+cat("Significant genes (padj<0.05):", length(sig_genes), "\n")
+
+if(length(sig_genes) < 5) {
+  message("Fewer than 5 significant genes; consider using padj < 0.1 or top N genes for enrichment.")
+}
+
+# Try GO BP enrichment using TAIR IDs (GeneIDs from GTF should be TAIR IDs like AT1G01010).
+# clusterProfiler expects Entrez or SYMBOL depending on OrgDb; org.At.tair.db supports TAIR (keyType = "TAIR")
+ego <- tryCatch({
+  enrichGO(gene = sig_genes, OrgDb = org.At.tair.db, keyType = "TAIR",
+           ont = "BP", pAdjustMethod = "BH", pvalueCutoff = 0.05, qvalueCutoff = 0.2)
+}, error = function(e) { message("GO enrichment error: ", e$message); NULL })
+
+if(!is.null(ego) && nrow(as.data.frame(ego))>0) {
+  go_df <- as.data.frame(ego)
+  write.csv(go_df, file = file.path(outdir, "GO_enrichment_BP.csv"), row.names = FALSE)
+  write.csv(go_df[1:min(5,nrow(go_df)), ], file = file.path(outdir, "top5_GO_BP.csv"), row.names = FALSE)
+  cat("Wrote GO enrichment results\n")
+} else {
+  cat("No GO BP enrichment results or too few genes.\n")
+}
+
+# KEGG enrichment — need Entrez IDs mapping
+map <- AnnotationDbi::select(org.At.tair.db, keys = sig_genes, keytype = "TAIR", columns = c("ENTREZID"))
+entrez_sig <- unique(na.omit(map$ENTREZID))
+if(length(entrez_sig) > 0) {
+  ekegg <- tryCatch({
+    enrichKEGG(gene = entrez_sig, organism = "ath", pvalueCutoff = 0.1)
+  }, error = function(e) { message("KEGG enrichment error: ", e$message); NULL })
+  if(!is.null(ekegg) && nrow(as.data.frame(ekegg))>0) {
+    write.csv(as.data.frame(ekegg), file = file.path(outdir, "KEGG_enrichment.csv"), row.names = FALSE)
+    write.csv(as.data.frame(ekegg)[1:min(5,nrow(as.data.frame(ekegg))), ], file = file.path(outdir, "top5_KEGG.csv"), row.names = FALSE)
+    cat("Wrote KEGG enrichment results\n")
+  } else {
+    cat("No KEGG enrichment found.\n")
+  }
+} else {
+  cat("No Entrez IDs mapped — KEGG enrichment skipped.\n")
+}
+
+# Save normalized counts for top100
+write.csv(assay(vsd)[rownames(vsd) %in% top100$gene, ], file = file.path(outdir, "top100_vst_counts.csv"))
+
+cat("DESeq2 (featureCounts) analysis complete. Results in:", outdir, "\n")
+
+
+
+
